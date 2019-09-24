@@ -44,6 +44,11 @@ import logging
 import random
 import re
 import time
+from enum import Enum
+from attr import attr, attrs
+from abc import abstractproperty, ABC
+from typing import Optional
+
 
 logger = logging.getLogger('schedule')
 
@@ -76,6 +81,7 @@ class Scheduler(object):
     factories to create jobs, keep record of scheduled jobs and
     handle their execution.
     """
+
     def __init__(self):
         self.jobs = []
 
@@ -145,7 +151,9 @@ class Scheduler(object):
 
     def _run_job(self, job):
         ret = job.run()
-        if isinstance(ret, CancelJob) or ret is CancelJob:
+        if isinstance(ret, CancelJob) \
+                or ret is CancelJob \
+                or job.only_execute_once:
             self.cancel_job(job)
 
     @property
@@ -168,6 +176,102 @@ class Scheduler(object):
         return (self.next_run - datetime.datetime.now()).total_seconds()
 
 
+class TimeUnit(Enum):
+    SECOND = 1
+    MINUTE = 2
+    HOUR = 3
+    DAY = 4
+    WEEK = 5
+
+
+class DayOfWeek(Enum):
+    MONDAY = 1
+    TUESDAY = 2
+    WEDNESDAY = 3
+    THURSDAY = 4
+    FRIDAY = 5
+    SATURDAY = 6
+    SUNDAY = 7
+
+
+class TimeSpec(ABC):
+    """A set of times."""
+    @abstractproperty
+    def next_run(self, now):
+        pass
+
+
+@attrs
+class CompatabilityTimeSpec(object):
+    interval: int = attr()
+    unit: TimeUnit = attr()
+    start_day: DayOfWeek = attr()
+    at_time: Optional[datetime.datetime] = attr(default=None)
+    period: Optional[datetime.timedelta] = attr(default=None)
+
+    @property
+    def next_run(self, now):
+        """
+        Compute the instant when this job should run next.
+        """
+        # TODO(woursler): Implement latest
+        if self.latest is not None:
+            if not (self.latest >= self.interval):
+                raise ScheduleError('`latest` is greater than `interval`')
+            interval = random.randint(self.interval, self.latest)
+        else:
+            interval = self.interval
+
+        self.period = datetime.timedelta(**{self.unit: interval})
+        self.next_run = now + self.period
+        if self.start_day is not None:
+            if self.unit != TimeUnit.WEEK:
+                raise ScheduleValueError('`unit` should be \'weeks\'')
+            weekday = weekdays.index(self.start_day)
+            days_ahead = weekday - self.next_run.weekday()
+            if days_ahead <= 0:  # Target day already happened this week
+                days_ahead += 7
+            self.next_run += datetime.timedelta(days_ahead) - self.period
+        if self.at_time is not None:
+            if (self.unit not in (TimeUnit.DAY, TimeUnit.HOUR, TimeUnit.MINUTE)
+                    and self.start_day is None):
+                raise ScheduleValueError(('Invalid unit without'
+                                          ' specifying start day'))
+
+            # TODO(woursler): Make this into a datetime object.
+            kwargs = {
+                'second': self.at_time.second,
+                'microsecond': 0
+            }
+            if self.unit == TimeUnit.DAY or self.start_day is not None:
+                kwargs['hour'] = self.at_time.hour
+            if self.unit in [TimeUnit.DAY, TimeUnit.HOUR] or self.start_day is not None:
+                kwargs['minute'] = self.at_time.minute
+
+            self.next_run = self.next_run.replace(**kwargs)
+            # If we are running for the first time, make sure we run
+            # at the specified time *today* (or *this hour*) as well
+            if not self.last_run:
+                if (self.unit == 'days' and self.at_time > now.time() and
+                        self.interval == 1):
+                    self.next_run = self.next_run - datetime.timedelta(days=1)
+                elif self.unit == 'hours' \
+                        and self.at_time.minute > now.minute \
+                        or (self.at_time.minute == now.minute
+                            and self.at_time.second > now.second):
+                    self.next_run = self.next_run - datetime.timedelta(hours=1)
+                elif self.unit == 'minutes' \
+                        and self.at_time.second > now.second:
+                    self.next_run = self.next_run - \
+                        datetime.timedelta(minutes=1)
+        if self.start_day is not None and self.at_time is not None:
+            # Let's see if we will still make that time we specified today
+            if (self.next_run - now).days >= 7:
+                self.next_run -= self.period
+
+# TODO(woursler): Randomized timespec
+
+
 class Job(object):
     """
     A periodic job as used by :class:`Scheduler`.
@@ -185,6 +289,7 @@ class Job(object):
     A job is usually created and returned by :meth:`Scheduler.every`
     method, which also defines its `interval`.
     """
+
     def __init__(self, interval, scheduler=None):
         self.interval = interval  # pause interval * unit between runs
         self.latest = None  # upper limit to the interval
@@ -196,6 +301,7 @@ class Job(object):
         self.period = None  # timedelta between runs, only valid for
         self.start_day = None  # Specific day of the week to start on
         self.tags = set()  # unique set of tags for the job
+        self.only_execute_once = False
         self.scheduler = scheduler  # scheduler to register with
 
     def __lt__(self, other):
@@ -548,7 +654,7 @@ class Job(object):
                 elif self.unit == 'minutes' \
                         and self.at_time.second > now.second:
                     self.next_run = self.next_run - \
-                                    datetime.timedelta(minutes=1)
+                        datetime.timedelta(minutes=1)
         if self.start_day is not None and self.at_time is not None:
             # Let's see if we will still make that time we specified today
             if (self.next_run - datetime.datetime.now()).days >= 7:
